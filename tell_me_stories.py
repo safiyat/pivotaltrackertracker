@@ -1,11 +1,16 @@
 import argparse
 from copy import deepcopy
+import csv
 from datetime import datetime as dt
+from datetime import timedelta as td
 import json
 import os
 import re
 import requests
 import sys
+from tabulate import tabulate
+import tempfile
+from yaml import dump as yaml_dump
 
 
 class PivotalTrackerEndpoints(object):
@@ -67,6 +72,18 @@ class PivotalTrackerConstants(object):
     URL = 'url'
 
 class PTC(PivotalTrackerConstants):
+    # Just an alias.
+    pass
+
+
+class PivotalTrackerTrackerConstants(object):
+    FINAL_CYCLE_TIME = 'final_cycle_time'
+    DEVELOPMENT_TIME = 'development_time'
+    REVIEW_PROCESS_TIME = 'review_process_time'
+    ACCEPTANCE_PROCESS_TIME = 'acceptance_process_time'
+
+
+class PTTC(PivotalTrackerTrackerConstants):
     # Just an alias.
     pass
 
@@ -148,6 +165,8 @@ class PivotalTrackerStoriesFetcher(object):
             story[PTC.OWNERS] = \
                 [get_dict_from_list(users, PTC.ID, owner_id)[0][PTC.NAME]
                  for owner_id in story.pop(PTC.OWNER_IDS)]
+            if PTC.ESTIMATE not in story:
+                story[PTC.ESTIMATE] = '-'
             for transition in story[PTC.TRANSITIONS]:
                 user = get_dict_from_list(
                     users, PTC.ID, transition.pop(PTC.PERFORMED_BY_ID))
@@ -166,13 +185,34 @@ class PivotalTrackerStoriesFetcher(object):
             acceptances = get_dict_from_list(
                 story[PTC.TRANSITIONS], PTC.STATE, PTC.ACCEPTED)
             if starts and acceptances:
-                story[PTC.CYCLE_TIME_DETAILS][PTC.CYCLE_TIME] = str(
+                story[PTC.CYCLE_TIME_DETAILS][PTTC.FINAL_CYCLE_TIME] = str(
                     dt.fromisoformat(acceptances[-1][PTC.OCCURRED_AT][:-1]) -
                     dt.fromisoformat(starts[-1][PTC.OCCURRED_AT][:-1]))
-            story[PTC.CYCLE_TIME_DETAILS].pop(PTC.TOTAL_CYCLE_TIME, None)
-            story[PTC.CYCLE_TIME_DETAILS].pop(PTC.STARTED_TIME, None)
-            story[PTC.CYCLE_TIME_DETAILS].pop(PTC.FINISHED_TIME, None)
-            story[PTC.CYCLE_TIME_DETAILS].pop(PTC.DELIVERED_TIME, None)
+            else:
+                story[PTC.CYCLE_TIME_DETAILS][PTTC.FINAL_CYCLE_TIME] = '0:00:00'
+
+            story_ctd = story[PTC.CYCLE_TIME_DETAILS]
+            if PTC.TOTAL_CYCLE_TIME in story_ctd:
+                story_ctd[PTC.TOTAL_CYCLE_TIME] = \
+                    str(td(seconds=story_ctd.pop(PTC.TOTAL_CYCLE_TIME) / 1000))
+            else:
+                story_ctd[PTC.TOTAL_CYCLE_TIME] = '0:00:00'
+            if PTC.STARTED_TIME in story_ctd:
+                story_ctd[PTTC.DEVELOPMENT_TIME] = \
+                    str(td(seconds=story_ctd.pop(PTC.STARTED_TIME) / 1000))
+            else:
+                story_ctd[PTC.STARTED_TIME] = '0:00:00'
+            if PTC.FINISHED_TIME in story_ctd:
+                story_ctd[PTTC.REVIEW_PROCESS_TIME] = \
+                    str(td(seconds=story_ctd.pop(PTC.FINISHED_TIME) / 1000))
+            else:
+                story_ctd[PTC.FINISHED_TIME] = '0:00:00'
+            if PTC.DELIVERED_TIME in story_ctd:
+                story_ctd[PTTC.ACCEPTANCE_PROCESS_TIME] = \
+                    str(td(seconds=story_ctd.pop(PTC.DELIVERED_TIME) / 1000))
+            else:
+                story_ctd[PTC.DELIVERED_TIME] = '0:00:00'
+
             story[PTC.CYCLE_TIME_DETAILS].pop(PTC.KIND, None)
             story[PTC.CYCLE_TIME_DETAILS].pop(PTC.STORY_ID, None)
             story[PTC.CYCLE_TIME_DETAILS].pop('', None)
@@ -180,13 +220,26 @@ class PivotalTrackerStoriesFetcher(object):
             story[PTC.CYCLE_TIME_DETAILS].pop('', None)
         return pruned_stories
 
+    def _flatten_stories(self, stories):
+        flattened_stories = deepcopy(stories)
+        for story in flattened_stories:
+            story.update(story.pop(PTC.CYCLE_TIME_DETAILS, {}))
+            flattened_transitions = list()
+            for transition in story[PTC.TRANSITIONS]:
+                flattened_transitions.append(
+                    ", ".join(["%s:%s" % (k, v) for k, v in
+                               transition.items()]))
+            story[PTC.TRANSITIONS] = flattened_transitions
+
+        return flattened_stories
+
     def fetch_stories(
             self, labels=None, updated_after=None, updated_before=None,
             fields=None, prune=True):
         default_fields = \
-            [PTC.ACCEPTED_AT, PTC.CURRENT_STATE, PTC.CYCLE_TIME_DETAILS,
-             PTC.ESTIMATE, PTC.ID, PTC.LABELS, PTC.NAME, PTC.OWNER_IDS,
-             PTC.STORY_TYPE, PTC.TRANSITIONS, PTC.URL]
+            [PTC.CURRENT_STATE, PTC.CYCLE_TIME_DETAILS, PTC.ESTIMATE, PTC.ID,
+             PTC.LABELS, PTC.NAME, PTC.OWNER_IDS, PTC.STORY_TYPE,
+             PTC.TRANSITIONS, PTC.URL]
 
         params = dict()
 
@@ -208,6 +261,7 @@ class PivotalTrackerStoriesFetcher(object):
             users = [membership[PTC.PERSON] for membership in
                      json.loads(response.text)]
             stories = self._prune_stories(stories, users)
+            stories = self._flatten_stories(stories)
         return stories
 
 
@@ -247,40 +301,77 @@ class CommandProcessor(object):
 
         parser = argparse.ArgumentParser()
         parser.add_argument('-t', '--token', type=valid_token, required=True,
+                            metavar='0123456789abcdef0123456789abcdef',
                             help='A valid Pivotal Tracker API token.')
         parser.add_argument('-p', '--project-id', type=int, required=True,
+                            metavar='12345',
                             help='A valid Pivotal Tracker project ID.')
-        parser.add_argument('-l', '--labels', action='append', required=False,
-                            help='The label to be used to fetched the stories.')
+        parser.add_argument('-l', '--label', action='append', required=False,
+                            metavar='label',
+                            help='The label to be used to fetched the stories. '
+                                 'Can be used multiple times.')
         parser.add_argument('-ua', '--updated-after', type=valid_date,
                             required=False,
+                            metavar='YYYY-MM-DD',
                             help='Finds all stories that were last updated '
                                  'after the given date. The date format is '
                                  'YYYY-MM-DD.')
         parser.add_argument('-ub', '--updated-before', type=valid_date,
                             required=False,
+                            metavar='YYYY-MM-DD',
                             help='Finds all stories that were last updated '
                                  'before the given date. The date format is '
                                  'YYYY-MM-DD.')
+        parser.add_argument('-f', '--fields', type=str,
+                            metavar='field1,field2,field3,...',
+                            help='Comma-separated output fields. The fields are'
+                                 ' the headers in the output.')
+        parser.add_argument('-o', '--output-format', type=str,
+                            choices=['table', 'json', 'yaml', 'csv'],
+                            default='table',
+                            help='The output format to be used.')
+        parser.add_argument('-w', '--write-to-file', type=str,
+                            metavar='filename',
+                            help='Write to the given filename.')
         return parser
+
+    def __filter_output_fields(self, stories, fields):
+        """
+        :param fields: A comma-separated list of strings.
+        :return: filtered output.
+        """
+        fields_list = [field.strip() for field in fields.split(',')]
+
+        filtered_stories = list()
+        for story in stories:
+            s = dict()
+            for field in fields_list:
+                try:
+                    s[field] = story[field]
+                except KeyError as e:
+                    print('Invalid field name \'%s\'.' % field)
+                    sys.exit(1)
+            filtered_stories.append(s)
+        return filtered_stories
+
 
     def process_commands(self):
         if '-t' not in sys.argv and '--token' not in sys.argv and \
                         'TOKEN' in os.environ:
-            sys.argv.insert(1, os.environ.get('TOKEN', ''))
+            sys.argv.insert(1, os.environ['TOKEN'])
             sys.argv.insert(1, '--token')
 
         if '-p' not in sys.argv and '--project-id' not in sys.argv and \
                         'PROJECT_ID' in os.environ:
-            sys.argv.insert(1, os.environ.get('PROJECT_ID', ''))
+            sys.argv.insert(1, os.environ['PROJECT_ID'])
             sys.argv.insert(1, '--project-id')
 
         parser = self._get_parser()
         args = parser.parse_args()
         kwargs = dict()
 
-        if args.labels:
-            kwargs[PTC.LABELS] = args.labels
+        if args.label:
+            kwargs[PTC.LABELS] = args.label
         if args.updated_after:
             kwargs[PTC.UPDATED_AFTER] = args.updated_after
         if args.updated_before:
@@ -291,7 +382,37 @@ class CommandProcessor(object):
             token=args.token, project_id=args.project_id)
         stories = fetcher.fetch_stories(**kwargs)
 
-        print(json.dumps(stories, indent=2))
+        if args.fields:
+            stories = self.__filter_output_fields(stories, args.fields)
+
+        if args.output_format == 'csv':
+            temp_fd, temp_fn = tempfile.mkstemp()
+            with open(temp_fn, "w") as fp:
+                csv_file = csv.writer(fp)
+                headers = list(stories[0].keys())
+                csv_file.writerow(headers)
+                for story in stories:
+                    csv_file.writerow([story[header] for header in headers])
+            with open(temp_fn) as fp:
+                formatted_output = fp.read()
+            os.remove(temp_fn)
+        elif args.output_format == 'json':
+            formatted_output = json.dumps(stories, indent=2)
+        elif args.output_format == 'yaml':
+            formatted_output = yaml_dump(stories, allow_unicode=True)
+        else:  #  args.output_format == 'table'
+            headers = list(stories[0].keys())
+            body = list()
+            for story in stories:
+                body.append([story[header] for header in headers])
+            formatted_output = tabulate(
+                body, headers=headers, tablefmt='pretty')
+
+        if args.write_to_file:
+            with open(args.write_to_file, 'w') as fp:
+                fp.write(formatted_output)
+        else:
+            print(formatted_output.strip())
 
 
 def main():
