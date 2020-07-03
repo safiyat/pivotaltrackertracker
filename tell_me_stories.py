@@ -48,6 +48,8 @@ class PivotalTrackerConstants(object):
     KIND = 'kind'
     LABEL = 'label'
     LABELS = 'labels'
+    LIMIT = 'limit'
+    MAX_NUMBER_OF_ITEMS = 500
     NAME = 'name'
     OCCURRED_AT = 'occurred_at'
     OWNERS = 'owners'
@@ -247,10 +249,15 @@ class PivotalTrackerStoriesFetcher(object):
             self.__build_filter(labels, updated_after, updated_before))
         params.update(self.__build_fields(fields or default_fields))
 
+        params[PTC.LIMIT] = PTC.MAX_NUMBER_OF_ITEMS
+
         # print(params)
         response = self._make_request(
             PTE.STORIES_URL.format(PROJECT_ID=self.__project_id), params=params)
         stories = json.loads(response.text)
+
+        if os.environ.get('DEBUG'):
+            print("Total stories from request: %d" % len(stories))
 
         # only_labels = [', '.join([l['name'] for l in
         #                           story['labels']]) for story in stories]
@@ -262,6 +269,8 @@ class PivotalTrackerStoriesFetcher(object):
                      json.loads(response.text)]
             stories = self._prune_stories(stories, users)
             stories = self._flatten_stories(stories)
+            if os.environ.get('DEBUG'):
+                print("Total stories post prune: %d" % len(stories))
         return stories
 
 
@@ -382,8 +391,14 @@ class CommandProcessor(object):
             token=args.token, project_id=args.project_id)
         stories = fetcher.fetch_stories(**kwargs)
 
+        if os.environ.get('DEBUG'):
+            print("Total stories fetched: %d" % len(stories))
+
         if args.fields:
             stories = self.__filter_output_fields(stories, args.fields)
+
+        if os.environ.get('DEBUG'):
+            print("Total stories filtered: %d" % len(stories))
 
         if args.output_format == 'csv':
             temp_fd, temp_fn = tempfile.mkstemp()
